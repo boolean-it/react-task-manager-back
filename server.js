@@ -28,6 +28,41 @@ app.use(express.json({ limit: 'Infinity' }));
 // **CACHE in memoria**
 let tasksCache = [];
 
+// **Sistema di locking per operazioni critiche**
+let isOperationInProgress = false;
+const pendingOperations = [];
+
+// **Mutex per operazioni critiche**
+const executeCriticalOperation = async (operation) => {
+    return new Promise((resolve, reject) => {
+        pendingOperations.push(async () => {
+            try {
+                const result = await operation();
+                resolve(result);
+            } catch (error) {
+                reject(error);
+            }
+        });
+        
+        if (!isOperationInProgress) {
+            processPendingOperations();
+        }
+    });
+};
+
+const processPendingOperations = async () => {
+    if (isOperationInProgress || pendingOperations.length === 0) return;
+    
+    isOperationInProgress = true;
+    
+    while (pendingOperations.length > 0) {
+        const operation = pendingOperations.shift();
+        await operation();
+    }
+    
+    isOperationInProgress = false;
+};
+
 // **Coda per scritture asincrone**
 const writeQueue = [];
 
@@ -55,15 +90,16 @@ const loadTasks = async () => {
 
 // **Salvare i dati nel file (usando la coda)**
 const saveTasks = async () => {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
         writeQueue.push(async () => {
             try {
                 await fs.writeFile(DATA_FILE, JSON.stringify(tasksCache, null, 2), "utf-8");
                 console.log("✅ Dati salvati su file.");
+                resolve();
             } catch (error) {
                 console.error("⚠️ Errore nel salvataggio:", error);
+                reject(error);
             }
-            resolve();
         });
         if (writeQueue.length === 1) {
             processWriteQueue(); // Avvia la scrittura solo se la coda era vuota
@@ -94,59 +130,87 @@ app.get("/tasks", (req, res) => {
 
 // 📌 **POST /tasks - Aggiungi un nuovo task**
 app.post("/tasks", async (req, res) => {
-    const newTask = req.body;
-    
-    // Validazione
-    const errors = validateTask(newTask);
-    if (errors.length > 0) {
-        return res.status(400).json({ success: false, message: errors.join(" ") });
+    try {
+        const result = await executeCriticalOperation(async () => {
+            const newTask = req.body;
+            
+            // Validazione
+            const errors = validateTask(newTask);
+            if (errors.length > 0) {
+                throw new Error(errors.join(" "));
+            }
+
+            // Creazione ID univoco
+            newTask.id = tasksCache.length > 0 ? Math.max(...tasksCache.map((t) => t.id)) + 1 : 1;
+            newTask.createdAt = new Date().toISOString();
+
+            tasksCache.push(newTask);
+            await saveTasks();
+
+            return { success: true, task: newTask };
+        });
+
+        res.status(201).json(result);
+    } catch (error) {
+        res.status(400).json({ success: false, message: error.message });
     }
-
-    // Creazione ID univoco
-    newTask.id = tasksCache.length > 0 ? Math.max(...tasksCache.map((t) => t.id)) + 1 : 1;
-    newTask.createdAt = new Date().toISOString();
-
-    tasksCache.push(newTask);
-    await saveTasks();
-
-    res.status(201).json({ success: true, task: newTask });
 });
 
 // 📌 **PUT /tasks/:id - Modifica un task**
 app.put("/tasks/:id", async (req, res) => {
-    const taskId = parseInt(req.params.id);
-    const updatedTask = req.body;
+    try {
+        const result = await executeCriticalOperation(async () => {
+            const taskId = parseInt(req.params.id);
+            const updatedTask = req.body;
 
-    // Validazione
-    const errors = validateTask(updatedTask);
-    if (errors.length > 0) {
-        return res.status(400).json({ success: false, message: errors.join(" ") });
+            // Validazione
+            const errors = validateTask(updatedTask);
+            if (errors.length > 0) {
+                throw new Error(errors.join(" "));
+            }
+
+            const taskIndex = tasksCache.findIndex((t) => t.id === taskId);
+            if (taskIndex === -1) {
+                throw new Error("Task non trovato.");
+            }
+
+            tasksCache[taskIndex] = { ...tasksCache[taskIndex], ...updatedTask };
+            await saveTasks();
+
+            return { success: true, task: tasksCache[taskIndex] };
+        });
+
+        res.json(result);
+    } catch (error) {
+        if (error.message === "Task non trovato.") {
+            res.status(404).json({ success: false, message: error.message });
+        } else {
+            res.status(400).json({ success: false, message: error.message });
+        }
     }
-
-    const taskIndex = tasksCache.findIndex((t) => t.id === taskId);
-    if (taskIndex === -1) {
-        return res.status(404).json({ success: false, message: "Task non trovato." });
-    }
-
-    tasksCache[taskIndex] = { ...tasksCache[taskIndex], ...updatedTask };
-    await saveTasks();
-
-    res.json({ success: true, task: tasksCache[taskIndex] });
 });
 
 // 📌 **DELETE /tasks/:id - Elimina un task**
 app.delete("/tasks/:id", async (req, res) => {
-    const taskId = parseInt(req.params.id);
+    try {
+        const result = await executeCriticalOperation(async () => {
+            const taskId = parseInt(req.params.id);
 
-    const taskIndex = tasksCache.findIndex((task) => task.id === taskId);
-    if (taskIndex === -1) {
-        return res.status(404).json({ success: false, message: "Task non trovato." });
+            const taskIndex = tasksCache.findIndex((task) => task.id === taskId);
+            if (taskIndex === -1) {
+                throw new Error("Task non trovato.");
+            }
+
+            tasksCache.splice(taskIndex, 1);
+            await saveTasks();
+
+            return { success: true };
+        });
+
+        res.json(result);
+    } catch (error) {
+        res.status(404).json({ success: false, message: error.message });
     }
-
-    tasksCache.splice(taskIndex, 1);
-    await saveTasks();
-
-    res.json({ success: true });
 });
 
 // **Se il file JSON non esiste, crearlo con dati iniziali**
