@@ -138,12 +138,12 @@ app.put("/tasks/:id", async (req, res) => {
 app.delete("/tasks/:id", async (req, res) => {
     const taskId = parseInt(req.params.id);
 
-    const filteredTasks = tasksCache.filter((task) => task.id !== taskId);
-    if (filteredTasks.length === tasksCache.length) {
+    const taskIndex = tasksCache.findIndex((task) => task.id === taskId);
+    if (taskIndex === -1) {
         return res.status(404).json({ success: false, message: "Task non trovato." });
     }
 
-    tasksCache = filteredTasks;
+    tasksCache.splice(taskIndex, 1);
     await saveTasks();
 
     res.json({ success: true });
